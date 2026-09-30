@@ -366,6 +366,25 @@ Plug-and-play middleware intercepts agent actions before tools are executed:
 
 - **LangChain**: [`createLangChainGuardMiddleware`](docs/examples/langchain.md) wraps tool calls using `AgentMiddleware.wrap_tool_call`. If the guard refuses or the verdict is undetermined, execution is halted client-side with a formatted `ToolMessage` carrying the contract reason code and explanation. The tool handler never runs, avoiding network submission fees. See the [full runnable LangChain example](docs/examples/langchain.md) ([`examples/langchain.ts`](examples/langchain.ts)).
 - **ElizaOS**: [`createGuardValidator`](docs/examples/elizaos.md) and [`guardAction`](docs/examples/elizaos.md) compose pre-flight simulation into `Action.validate`. Refused actions return boolean `false`, excluding them from candidate execution. See the [full runnable ElizaOS example](docs/examples/elizaos.md) ([`examples/elizaos.ts`](examples/elizaos.ts)).
+- **MCP**: [`guardMcpToolHandler`](docs/examples/mcp.md) wraps a Model Context Protocol tool handler (`registerTool` / `tool` / `setRequestHandler(CallToolRequestSchema)`), and [`guardMcpCallTool`](docs/examples/mcp.md) wraps a client's `callTool` before the request leaves the process. A refusal is returned as an `isError: true` result and the tool body never runs. See [the MCP integration example](docs/examples/mcp.md).
+
+#### Operator alerting on every halt (`onBlocked`)
+
+A refusal is visible to the agent (its tool result says so), but not to the human watching dashboards — telemetry is a separate opt-in. Every adapter takes an optional `onBlocked` callback that fires once per halt, so a refusal can be wired to a webhook, log, or alert channel:
+
+```ts
+const middleware = createLangChainGuardMiddleware({
+  interceptor,
+  toContractCall,
+  onBlocked: ({ adapter, kind, reason, call, explanation }) => {
+    console.warn(`[${adapter}] ${kind}: ${reason ?? "undetermined"} on ${call.fn} — ${explanation}`);
+  },
+});
+```
+
+The payload is the same on every adapter (`{ adapter, kind, reason, call, explanation }`): `kind` is `"blocked"` when the guard refused and `"undetermined"` when enforcement could not decide (in which case `reason` is `null` and `explanation` carries the failure detail — the halt still happens, because the adapter fails closed). The callback is called *after* the halt is decided and its errors are logged and swallowed, so a broken alerting sink can never turn a refusal into an executed action or a thrown error. Omit `onBlocked` for exactly the pre-existing behavior.
+
+> **ElizaOS note (0.2.x):** the ElizaOS adapter previously passed the raw `PreFlightDecision` to `onBlocked`; it now receives this structured payload, matching LangChain and MCP. Read `info.reason` / `info.explanation` (or `info.kind`) instead of `decision.reason` / `decision.explanation`.
 
 ### Policy validation before broadcast (validateGuardPolicy)
 
@@ -663,7 +682,7 @@ one-shot form.
 - `decodeCheckResult(raw): CheckResult` — Decodes `Allowed` or `Blocked(reason)`.
 - `decodeAuthDecision(event: SorobanRpc.Api.GetEventsResponse.Event): AuthDecisionEvent | null`
 - `guardEventsFromDiagnostics(events: xdr.DiagnosticEvent[]): GuardEvent[]` — Each decoded `GuardEvent` carries a stable `id`: `ledger:<txHash>:<topic>` for committed events, `diag:<sha256>` for blocked ones (which are rolled back and have no hash to anchor on). Same event re-parsed → same id; two different blocks in one simulation → different ids. Format and collision notes: [`docs/event-schema.md`](docs/event-schema.md).
-- `explainReason(reason: string | number): string` — Human-readable explanation of contract reason codes.
+- `explainReason(reason: string | number, locale?, overrides?): string` — Human-readable explanation of contract reason codes. The default call is unchanged; the optional `locale` catalog and per-reason `overrides` localise or reword a refusal without an i18n dependency. Reason keys, titles and remediation text: [`reasonMessages` / `reasonMessagesEn`](#reason-messages-issue-96).
 - `isDeadManFrozen(status: GuardStatus): boolean`
 - `deadManRemaining(status: GuardStatus, policy: PolicyConfig | null): bigint | null`
 
@@ -687,6 +706,46 @@ const recentWindow = listener.recent({ fromLedger: 4_700_000 });
 ```
 
 `recent(filter?)` returns the retained events oldest-first, filtered by any of `stream`, `reason`, `fromLedger`, `toLedger`. The buffer is FIFO and non-durable: it holds only what this listener decoded in this process, and a restart empties it. Persistence across restarts is a cursor store (tracked separately), not something this buffer pretends to provide.
+
+#### Raw events for bug reports (issue #94)
+
+When a decoded verdict looks wrong, attach the **undecoded source event** to the SDK bug report. Decoding discards it by default — the raw payload carries XDR `ScVal`s and host-shaped objects, and retaining one per event is a memory decision — so it is opt-in:
+
+```ts
+// Committed feed: opt in on the listener.
+const listener = new GuardTelemetryListener({ server, guard: GUARD_ID, includeRaw: true });
+
+// Diagnostic feed: opt in at the decode site.
+const events = guardEventsFromDiagnostics(diagnosticEvents, GUARD_ID, { includeRaw: true });
+
+// Every event then carries `raw`: the `rpc.Api.EventResponse` for a committed
+// event, or the host-shaped diagnostic object for a blocked one.
+const event = (await listener.poll({ startLedger })).events[0];
+console.error(JSON.stringify(event.raw, (_key, value) =>
+  typeof value === "bigint" ? value.toString() : value));
+```
+
+When `includeRaw` is not set, `raw` is **absent** (undefined) — nothing is retained. Leave it off in a long-running fleet; turn it on for the debugging session or the bug-report window. The `id` field stays stable either way, so a raw event can be correlated with the decoded event it produced.
+
+#### Reason messages (issue #96)
+
+`reasonMessages` exposes each reason's numeric code and its stable title/body/remediation keys, and `reasonMessagesEn` holds the built-in English text — so a dashboard can render a table, and a consumer can key its own translations, without the SDK taking an i18n dependency:
+
+```ts
+import { reasonMessages, reasonMessagesEn, explainReason } from "stellar-agent-guard-sdk";
+
+for (const [reason, { code, titleKey, remediationKey }] of Object.entries(reasonMessages)) {
+  console.log(code, reasonMessagesEn[reason as keyof typeof reasonMessagesEn].title, remediationKey);
+}
+
+// Localise one reason; a missing key falls back to English.
+explainReason("per_tx_cap_exceeded", {
+  [reasonMessages.per_tx_cap_exceeded.bodyKey]: "Le montant dépasse le plafond par transaction.",
+});
+
+// Or override individual reasons outright.
+explainReason("paused", undefined, { paused: "Agent paused by the operator." });
+```
 
 ## Architecture
 
@@ -774,7 +833,7 @@ This boundary is an inherent property of the platform (the auth context does not
 ## Topics
 
 `stellar`, `soroban`, `ai-agents`, `guardrails`, `custom-account`, `pre-flight`,
-`spend-limits`, `cost-estimation`, `langchain`, `elizaos`, `telemetry`, `typescript`
+`spend-limits`, `cost-estimation`, `langchain`, `elizaos`, `mcp`, `telemetry`, `typescript`
 
 ## Maintainers
 
