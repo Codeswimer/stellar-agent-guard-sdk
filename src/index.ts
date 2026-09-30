@@ -45,6 +45,8 @@ export {
   GUARD_REASONS,
   explainReason,
   isGuardReason,
+  reasonMessages,
+  reasonMessagesEn,
   reasonName,
   reasonNameFromCode,
 } from "./reasons.ts";
@@ -53,6 +55,9 @@ export type {
   GuardBlockedErrorParams,
   GuardReason,
   GuardReasonName,
+  ReasonMessage,
+  ReasonMessageCatalog,
+  ReasonMessageText,
 } from "./reasons.ts";
 
 export {
@@ -194,6 +199,7 @@ export {
   type GuardEvent,
   type GuardEventBufferOptions,
   type GuardEventContext,
+  type GuardEventDecodeOptions,
   type GuardEventIdentityInput,
   type GuardEventKind,
   type GuardEventStream,
@@ -283,3 +289,30 @@ export type {
   ElizaGuardOptions,
   ElizaValidator,
 } from "./adapters/elizaos.ts";
+
+export {
+  guardMcpCallTool,
+  guardMcpToolHandler,
+} from "./adapters/mcp.ts";
+
+export type {
+  McpCallTool,
+  McpGuardOptions,
+  McpToolCallRequest,
+  McpToolHandler,
+  McpToolResult,
+} from "./adapters/mcp.ts";
+
+// The operator alerting primitive every adapter shares (`onBlocked`).
+// Exported so a consumer can type its sink and build the payload itself.
+export {
+  blockedInfoFor,
+  runBlockedHook,
+} from "./adapters/shared.ts";
+
+export type {
+  BlockedHookLogger,
+  GuardAdapterName,
+  GuardBlockedHook,
+  GuardBlockedInfo,
+} from "./adapters/shared.ts";
