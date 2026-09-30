@@ -42,6 +42,8 @@
     "agent-frameworks",
     "langchain",
     "elizaos",
+    "mcp",
+    "model-context-protocol",
     "integration-bridge",
     "dex",
     "lending",
