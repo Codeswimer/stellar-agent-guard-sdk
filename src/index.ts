@@ -323,3 +323,30 @@ export {
   type VercelAIToolCallInput,
   type VercelAIToolLike,
 } from "./adapters/vercelai.ts";
+
+export {
+  guardMcpCallTool,
+  guardMcpToolHandler,
+} from "./adapters/mcp.ts";
+
+export type {
+  McpCallTool,
+  McpGuardOptions,
+  McpToolCallRequest,
+  McpToolHandler,
+  McpToolResult,
+} from "./adapters/mcp.ts";
+
+// The operator alerting primitive every adapter shares (`onBlocked`).
+// Exported so a consumer can type its sink and build the payload itself.
+export {
+  blockedInfoFor,
+  runBlockedHook,
+} from "./adapters/shared.ts";
+
+export type {
+  BlockedHookLogger,
+  GuardAdapterName,
+  GuardBlockedHook,
+  GuardBlockedInfo,
+} from "./adapters/shared.ts";
