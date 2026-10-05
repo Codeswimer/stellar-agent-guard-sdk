@@ -286,9 +286,9 @@ Time-dependent modules (preflight cache, transaction polling) accept an optional
 ### Pipeline step observability (`onStep`)
 
 `invoke()` accepts an **optional** `onStep` callback. When omitted, behavior is
-exactly as before — the hook is pure observability and the SDK itself never
-logs anything (and takes no logger dependency; what you do with the events is
-up to you):
+exactly as before — the hook is pure observability and writes nothing itself
+(what you do with the events is up to you; for the SDK's own diagnostics see
+[Optional logging](#optional-logging-the-sdk-is-silent-unless-you-ask)):
 
 ```ts
 const outcome = await invoke({
@@ -318,9 +318,10 @@ a full `probe → sign → simulate → broadcast` sequence per attempt, each ta
 with its `attempt` index), and **callback exceptions are isolated**: a throwing
 `onStep` never breaks the pipeline, never turns a successful invoke into a
 failure, and never masks the original pipeline error — callback errors are
-swallowed silently, since the SDK is logger-agnostic and has no sink to report
-them to. Step names come from the same shared vocabulary the dry-run trace
-uses (`TRACE_STEP_NAMES`), so consumers of either see identical stage names.
+swallowed silently, because the callback is the caller's own code and not the
+SDK's sink to report through. Step names come from the same shared vocabulary
+the dry-run trace uses (`TRACE_STEP_NAMES`), so consumers of either see
+identical stage names.
 
 The LangChain adapter exposes the same capability:
 
@@ -333,6 +334,50 @@ const middleware = createLangChainGuardMiddleware({
   },
 });
 ```
+
+### Optional logging: the SDK is silent unless you ask
+
+A library that prints pollutes its host's logging pipeline — structured logs,
+level filtering, redirection — so **the SDK writes nothing by default.** The
+audit behind that claim, run for this change: `src/` contained exactly one
+`console.*` call, an env-gated debug dump in the invoke pipeline
+(`SAG_DEBUG_RESOURCES=1`). It is gone, and its description now goes to an
+injected logger, or nowhere. A unit test scans `src/` for console calls and
+direct stdout/stderr writes, so a new one fails `npm test` rather than quietly
+appearing in a host's output.
+
+What the SDK knows is still available, through an optional `logger` on every
+config that has a decision point — `PreFlightInterceptor`, `CostPreChecker`,
+`GuardTelemetryListener` and `invoke()`. Pass any object with the four levels;
+`console` itself satisfies the interface, as does a pino or winston child
+logger. Each call gets a complete message plus optional structured detail, so a
+logger that ignores the detail still reads well:
+
+```ts
+import { PreFlightInterceptor } from "stellar-agent-guard-sdk";
+
+const interceptor = new PreFlightInterceptor({
+  server,
+  networkPassphrase,
+  guard,
+  agent,
+  source,
+  logger: {
+    debug: (message, meta) => log.debug({ ...meta }, message), // stages, cache hits, retries
+    info: (message, meta) => log.info({ ...meta }, message), // a guard refusal
+    warn: (message, meta) => log.warn({ ...meta }, message), // undetermined, fee ceiling, coverage gap
+  },
+});
+
+const decision = await interceptor.check(call); // same verdict, same fees — now audible
+```
+
+A level the host omits is dropped rather than routed elsewhere, and a level that
+throws is isolated: a broken sink cannot turn an admissible verdict into an
+error, change a retry count, or fail a broadcast. Logging is observability, and
+observability never decides whether a transaction runs. `logger: console` is
+the one-liner that restores the removed `SAG_DEBUG_RESOURCES=1` behaviour
+deliberately, instead of a library making that choice for its host.
 
 ### Framework Middleware (LangChain & ElizaOS)
 
@@ -609,6 +654,37 @@ The one intentional behavior change is for callers already using `dryRun: true`:
 success sentinel (`kind: "error"`) is replaced by the structured `kind: "dry_run"` result
 documented above. Non-dry-run callers keep their existing outcome shapes.
 
+### Keep the dead-man switch alive (`startHeartbeat`)
+
+An agent that stops heartbeating freezes. `startHeartbeat` schedules the `heartbeat()` calls and makes the failure modes visible instead of silent — an ad-hoc `setTimeout` loop drops a beat on an event-loop stall and turns an RPC blip into an unhandled rejection.
+
+```ts
+import { startHeartbeat } from "stellar-agent-guard-sdk";
+
+const hb = await startHeartbeat({
+  server,
+  guard: GUARD_ID,
+  signer: agentKeypair,        // Keypair or AgentSigner
+  intervalMs: 30_000,
+  maxSkewMs: 2_000,            // tolerated drift before a beat counts as missed
+  onBeat: ({ lateMs }) => { if (lateMs > 2_000) alert("heartbeat late"); },
+  onError: (error) => logger.error("heartbeat failed", error),
+  graceSecs: 150,              // optional pre-read: validated as interval <= grace/3
+});
+
+// on shutdown:
+await hb.stop();
+```
+
+- The first beat fires immediately, then every `intervalMs` on a fixed cadence — a slow beat surfaces as lateness on the next one instead of pushing the whole schedule.
+- A beat later than `maxSkewMs` increments `hb.missedBeats` and is reported as `lateMs` in `onBeat`; alert on lateness, not only on failure. `hb.lastBeatAt` is the epoch ms of the last successful beat.
+- Every submission rejection goes to `onError`; nothing escapes as an unhandled rejection.
+- `stop()` (or the `signal`) tears down cleanly: no beat is sent after it, and it resolves once an in-flight beat has settled.
+- When the grace window is readable (`graceSecs`, or a `readPolicy` read), an interval longer than `grace / 3` throws `HeartbeatIntervalError` **before** the first beat; an unreadable policy warns via `onWarning` and starts anyway.
+- A beat that would fall in the same wall-clock second as the previous accepted one is skipped client-side; the contract deduplicates independently.
+
+The combined heartbeat-loop + pre-flight pattern is tracked as an integration guide in [#74](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-sdk/issues/74).
+
 ## API Reference
 
 > **0.x API Policy & Deprecations:** During `0.x`, this package adheres to an **additive-only within minor** policy (`0.1.x` releases are additive and fixes only; breaking changes and deprecation removals occur only at minor boundaries like `0.2.0`). For full policy details, deprecation mechanics, and the tracking table, see [`docs/deprecations.md`](docs/deprecations.md). Release process and versioning checklist: [`docs/releasing.md`](docs/releasing.md).
@@ -625,6 +701,8 @@ documented above. Non-dry-run callers keep their existing outcome shapes.
   - `check(call: ContractCall): Promise<CostPreCheckResult>` — Returns `within_budget | over_budget | blocked | undetermined`.
   - `checkWithCost(call: ContractCall): Promise<{ decision, cost }>` — Returns the interceptor verdict and the cost of the **same** single simulation. Prefer this over calling `check()` on both classes.
 - `invoke(options: InvokeOptions): Promise<InvokeResult>` — End-to-end pipeline: probe, sign auth, simulate, and broadcast. Accepts an optional `onStep(step: InvokeStepEvent)` hook reporting per-stage `start`/`ok`/`fail` timing events with a 0-based retry `attempt` index; callback exceptions are isolated and omitting the hook changes nothing.
+- `startHeartbeat(options): Promise<HeartbeatHandle>` — Drift-aware dead-man keep-alive. Fires `heartbeat()` on an interval, reports lateness (`handle.missedBeats`, `onBeat`'s `lateMs`), routes every failure to `onError`, validates `interval <= grace/3` before the first beat when the grace window is readable, and stops cleanly (`await handle.stop()`). See “Keep the dead-man switch alive”.
+- `submitHeartbeat(params): Promise<HeartbeatSubmission>` — Signs and submits a single `heartbeat()` with the agent's guard authorization; the default submission `startHeartbeat` uses.
 
 #### Fee units: stroops and XLM
 
@@ -713,6 +791,7 @@ one-shot form.
 - `decodeAuthDecision(event: SorobanRpc.Api.GetEventsResponse.Event): AuthDecisionEvent | null`
 - `decodeGuardEventXdr(xdrBase64: string, source?: 'ledger' | 'diagnostic'): GuardAuthDecision | null` — Offline decode of a raw base64 event XDR. Accepts either a `DiagnosticEvent` (what `getEvents()` and a simulation error carry) or a `ContractEvent` (what a block explorer exposes) and returns the same decision the object-path decode produces. Malformed base64, an XDR that is not a contract event, and an event that is not an `event_auth_checked` decision all return `null` — it never throws, so fixture checks and operator copy-paste cannot crash a long-running process.
 - `guardEventsFromDiagnostics(events: xdr.DiagnosticEvent[]): GuardEvent[]` — Each decoded `GuardEvent` carries a stable `id`: `ledger:<txHash>:<topic>` for committed events, `diag:<sha256>` for blocked ones (which are rolled back and have no hash to anchor on). Same event re-parsed → same id; two different blocks in one simulation → different ids. Format and collision notes: [`docs/event-schema.md`](docs/event-schema.md).
+- `GuardLogger`, `GuardLoggerInput`, `GuardLogMeta`, `GUARD_LOG_LEVELS` — the optional, structurally-typed log sink shared by every config above; `SILENT_LOGGER` is what a config resolves to when none is supplied. See [Optional logging](#optional-logging-the-sdk-is-silent-unless-you-ask).
 - `explainReason(reason: string | number, locale?, overrides?): string` — Human-readable explanation of contract reason codes. The default call is unchanged; the optional `locale` catalog and per-reason `overrides` localise or reword a refusal without an i18n dependency. Reason keys, titles and remediation text: [`reasonMessages` / `reasonMessagesEn`](#reason-messages-issue-96).
 - `isDeadManFrozen(status: GuardStatus): boolean`
 - `deadManRemaining(status: GuardStatus, policy: PolicyConfig | null): bigint | null`

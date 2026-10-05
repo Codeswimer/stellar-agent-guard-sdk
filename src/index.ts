@@ -212,15 +212,18 @@ export {
   DEFAULT_JITTER_FRACTION,
   GuardEventRingBuffer,
   GuardTelemetryListener,
+  InMemoryCursorStore,
   computePollDelay,
   describeGuardEvent,
   diagnosticsToEvents,
   guardEventId,
   guardEventsFromDiagnostics,
+  guardEventsFromFailedTransaction,
   isAllowedDecision,
   mergeGuardEventStreams,
   serializeEvent,
   telemetryFromDecision,
+  type CursorStore,
   type GuardDiagnosticBatch,
   type GuardEvent,
   type GuardEventBufferOptions,
@@ -293,6 +296,17 @@ export {
   type GuardWasmVerification,
 } from "./wasm.ts";
 
+export {
+  HeartbeatIntervalError,
+  startHeartbeat,
+  submitHeartbeat,
+  type HeartbeatBeat,
+  type HeartbeatHandle,
+  type HeartbeatOptions,
+  type HeartbeatSubmission,
+  type SubmitHeartbeatParams,
+} from "./heartbeat.ts";
+
 // Framework adapters. Both are written structurally against their host's hook,
 // so neither framework is a dependency of this package.
 export {
@@ -350,3 +364,15 @@ export type {
   GuardBlockedHook,
   GuardBlockedInfo,
 } from "./adapters/shared.ts";
+
+// Optional logging. `SILENT_LOGGER` is the default every config resolves to
+// when no logger is supplied: the SDK writes nothing unless a host asks.
+export {
+  GUARD_LOG_LEVELS,
+  SILENT_LOGGER,
+  resolveLogger,
+  type GuardLogger,
+  type GuardLoggerInput,
+  type GuardLogLevel,
+  type GuardLogMeta,
+} from "./logger.ts";
